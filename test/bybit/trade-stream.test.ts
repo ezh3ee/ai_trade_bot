@@ -91,17 +91,39 @@ describe('обработка потока сделок', () => {
     expect(processor.totalTrades).toBe(3);
   });
 
-  it('лог сделок не засоряется — одна строка в секунду', () => {
+it('пульс раз в минуту, а не строчка в секунду (§14)', () => {
     const { log, lines } = recordingLogger();
     let clock = BASE;
     const processor = new TradeStreamProcessor(engine(), feed(), log, () => clock);
 
-    for (let i = 0; i < 50; i += 1) {
+    // 301 секунда = 5 полных минут = 5 пульсов
+    for (let i = 0; i < 301; i += 1) {
       clock = BASE + i * SECOND;
       processor.process([trade(clock, 100), trade(clock + 10, 100)]);
     }
 
-    expect(lines.filter((line) => line.message === 'сделки')).toHaveLength(50);
+    const pulses = lines.filter((line) => line.message.includes('/мин'));
+    expect(pulses.length).toBe(5);
+    // 600 вызовов process() НЕ должны дать 600 строк
+    expect(lines.length).toBeLessThan(10);
+  });
+
+  it('в пульсе видно цену и mark price', () => {
+    const { log, lines } = recordingLogger();
+    let clock = BASE;
+    const marketFeed = feed();
+    marketFeed.applyTicker({ symbol: 'BTCUSDT', markPrice: 83001 }, clock);
+    const processor = new TradeStreamProcessor(engine(), marketFeed, log, () => clock);
+
+    for (let i = 0; i < 130; i += 1) {
+      clock = BASE + i * SECOND;
+      processor.process([trade(clock, 83000)]);
+    }
+
+    const pulse = lines.find((line) => line.message.includes('/мин'));
+    expect(pulse?.message).toContain('BTCUSDT');
+    expect(pulse?.message).toContain('83000');
+    expect(pulse?.message).toContain('83001');
   });
 
   it('сброс чинит движок и обнуляет счётчик', () => {

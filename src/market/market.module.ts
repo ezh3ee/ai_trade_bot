@@ -3,7 +3,8 @@ import type { AppConfig } from '../config/schema.ts';
 import { MarketFeed } from './market-feed.ts';
 import type { TriggerEngineConfig } from './trigger-engine.ts';
 import { TriggerEngine } from './trigger-engine.ts';
-import { APP_CONFIG, MARKET_FEED, TRIGGER_ENGINE } from '../tokens.ts';
+import { RuntimeState } from '../app/runtime-state.ts';
+import { APP_CONFIG, MARKET_FEED, RUNTIME_STATE, TRIGGER_ENGINE } from '../tokens.ts';
 
 const SECOND_MS = 1000;
 const MINUTE_MS = 60_000;
@@ -26,8 +27,8 @@ export function toTriggerEngineConfig(config: AppConfig): TriggerEngineConfig {
 }
 
 /**
- * Движок и наблюдаемое состояние отдаются через useFactory, поэтому сами
- * классы остаются обычным TypeScript без декораторов.
+ * Движок, наблюдаемое состояние и состояние приложения отдаются через
+ * useFactory, поэтому сами классы остаются обычным TypeScript без декораторов.
  */
 @Module({
   providers: [
@@ -40,10 +41,14 @@ export function toTriggerEngineConfig(config: AppConfig): TriggerEngineConfig {
     {
       provide: MARKET_FEED,
       inject: [APP_CONFIG],
-      useFactory: (config: AppConfig): MarketFeed =>
-        new MarketFeed(config.bybit.symbol, Date.now()),
+      useFactory: (config: AppConfig): MarketFeed => new MarketFeed(config.bybit.symbol, Date.now()),
+    },
+    {
+      provide: RUNTIME_STATE,
+      inject: [APP_CONFIG],
+      useFactory: (config: AppConfig): RuntimeState => new RuntimeState(config.responseMode),
     },
   ],
-  exports: [TRIGGER_ENGINE, MARKET_FEED],
+  exports: [TRIGGER_ENGINE, MARKET_FEED, RUNTIME_STATE],
 })
 export class MarketModule {}

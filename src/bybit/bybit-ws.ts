@@ -58,6 +58,8 @@ export interface BybitWsOptions {
   readonly onTrades: (trades: readonly Trade[]) => void;
   readonly onReset: (reason: string) => void;
   readonly onTicker: (update: TickerData) => void;
+  readonly onConnected: () => void;
+  readonly onDisconnected: () => void;
   readonly log: Logger;
   readonly connect: (url: string) => WsHandle;
   readonly pingIntervalMs?: number;
@@ -88,6 +90,8 @@ export class BybitWsClient {
   private attempt = 0;
   private stopped = true;
   private lastTradeTimeMs: number | undefined;
+  private readonly ignoredReasons = new Map<string, number>();
+  private readonly seenReasons = new Set<string>();
 
   constructor(private readonly options: BybitWsOptions) {
     this.pingIntervalMs = options.pingIntervalMs ?? DEFAULT_PING_MS;
@@ -109,6 +113,7 @@ export class BybitWsClient {
     const socket = this.socket;
     this.socket = undefined;
     socket?.close();
+    this.options.onDisconnected();
   }
 
   private openSocket(): void {
@@ -119,6 +124,7 @@ export class BybitWsClient {
 
     socket.onOpen(() => {
       this.attempt = 0;
+      this.options.onConnected();
       this.options.log.info('ws: подключились', { url: this.options.url });
       socket.send(
         JSON.stringify({
@@ -134,6 +140,7 @@ export class BybitWsClient {
     });
 
     socket.onClose((code, reason) => {
+      this.options.onDisconnected();
       this.options.log.warn('ws: соединение закрыто', { code, reason });
       this.scheduleReconnect();
     });
@@ -160,7 +167,7 @@ export class BybitWsClient {
     switch (message.kind) {
       case 'trades': {
         if (message.topic !== tradeTopic(this.options.symbol)) {
-          this.options.log.debug('ws: чужой символ пропущен', { topic: message.topic });
+          this.noteIgnored(message.topic);
           return;
         }
         this.emitTrades(message.trades);
@@ -176,7 +183,7 @@ export class BybitWsClient {
         this.options.log.error('ws: подписка отклонена', { message: message.message });
         return;
       case 'ignored':
-        this.options.log.debug('ws: пропущено', { reason: message.reason });
+        this.noteIgnored(message.reason);
     }
   }
 
@@ -190,11 +197,28 @@ export class BybitWsClient {
       this.options.onReset(`разрыв ${gapMs} мс`);
     }
 
-    if (newest !== undefined) this.lastTradeTimeMs = newest.timeMs;
+if (newest !== undefined) this.lastTradeTimeMs = newest.timeMs;
     if (trades.length === 0) return;
 
-    this.options.log.debug('ws: сделок', { count: trades.length, lastPrice: newest?.price });
+    // Никакого логирования каждой сделки: это сотни строк в секунду.
+    // Количество и цена показываются в пульсе раз в минуту (§14).
     this.options.onTrades(trades);
+  }
+
+  /**
+   * Непонятные сообщения не пишем каждое — иначе счётчик сам себя забьёт.
+   * Пишем один раз на каждый новый вид мусора, дальше только молчим.
+   */
+  private noteIgnored(reason: string): void {
+    this.ignoredReasons.set(reason, (this.ignoredReasons.get(reason) ?? 0) + 1);
+    if (this.seenReasons.has(reason)) return;
+    this.seenReasons.add(reason);
+    this.options.log.debug('ws: пропущено (дальше молчу про это)', { причина: reason });
+  }
+
+  /** Сколько всего было пропущено, по видам. Показывается в пульсе. */
+  ignoredSummary(): Readonly<Record<string, number>> {
+    return Object.fromEntries(this.ignoredReasons);
   }
 
   private startPing(): void {

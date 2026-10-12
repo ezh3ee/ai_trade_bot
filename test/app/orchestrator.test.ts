@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
+﻿import { describe, expect, it } from 'vitest';
 import { AnalysisOrchestrator } from '../../src/app/orchestrator.ts';
+import { RuntimeState } from '../../src/app/runtime-state.ts';
 import { MarketFeed } from '../../src/market/market-feed.ts';
 import { loadPrompts } from '../../src/ai/prompts.ts';
 import { parseConfig } from '../../src/config/schema.ts';
@@ -8,7 +9,7 @@ import type { Logger } from '../../src/config/load.ts';
 import type { LlmProvider, GenerationResult } from '../../src/ai/provider.ts';
 import { DEFAULT_OPTIONS } from '../../src/ai/provider.ts';
 import type { TriggerEvent } from '../../src/market/trade.ts';
-import type { MessageSender } from '../../src/telegram/bot.ts';
+import type { Notifier } from '../../src/telegram/telegram-bot.ts';
 
 const BASE = 1_700_000_040_000;
 const GOOD_JSON =
@@ -37,6 +38,8 @@ function config(patch: Record<string, string> = {}): AppConfig {
 interface Harness {
   readonly orchestrator: AnalysisOrchestrator;
   readonly sent: string[];
+  readonly consoleOnly: string[];
+  readonly errors: string[];
   readonly calls: string[];
   readonly feed: MarketFeed;
 }
@@ -47,14 +50,27 @@ function make(options: {
   config?: AppConfig;
   delayMs?: number;
 } = {}): Harness {
-  const sent: string[] = [];
   const calls: string[] = [];
   const feed = new MarketFeed('BTCUSDT', BASE);
   feed.applyTicker({ symbol: 'BTCUSDT', lastPrice: 83000, markPrice: 83001, indexPrice: 82999 }, BASE);
   feed.noteTrade({ id: 'a', timeMs: BASE, price: 83000, volume: 1 });
 
   let clock = BASE;
-  const sender: MessageSender = { send: async (_chat, text) => { sent.push(text); } };
+  const notified: string[] = [];
+  const consoleOnly: string[] = [];
+  const errors: string[] = [];
+
+  const notifier: Notifier = {
+    notify: async (text) => {
+      notified.push(text);
+    },
+    reportError: async (text) => {
+      errors.push(text);
+    },
+    logOnly: (text) => {
+      consoleOnly.push(text);
+    },
+  };
 
   const llm: LlmProvider = {
     modelId: 'test',
@@ -79,13 +95,14 @@ function make(options: {
     log: silent,
     llm,
     prompts: loadPrompts('./prompts.example.yml'),
-    sender,
+    notifier,
+    state: new RuntimeState((options.config ?? config()).responseMode),
     ticker: () => feed.ticker(),
     priceNow: () => feed.priceNow(),
     now: () => clock,
   });
 
-  return { orchestrator, sent, calls, feed };
+  return { orchestrator, sent: notified, consoleOnly, errors, calls, feed };
 }
 
 const BREAKOUT: TriggerEvent = {
@@ -160,25 +177,70 @@ describe('защита от лишних запросов', () => {
   });
 });
 
-describe('ответы, которые нельзя показать как сигнал', () => {
-  it('мусор от модели -> WAIT с объяснением, а не исключение', async () => {
-    const h = make({ reply: 'не знаю' });
+describe('разделение каналов', () => {
+  it('LONG уходит в Telegram', async () => {
+    const h = make();
     await h.orchestrator.onTrigger(BREAKOUT);
     expect(h.sent).toHaveLength(1);
-    expect(h.sent[0]).toContain('WAIT');
-    expect(h.sent[0]).toContain('не разобран');
+    expect(h.consoleOnly).toHaveLength(0);
   });
 
-  it('падение LLM не роняет процесс', async () => {
+  it('WAIT в Telegram НЕ уходит, только в консоль', async () => {
+    const h = make({ reply: '{"direction":"WAIT","confidence":10,"summary":"спокойно"}' });
+    await h.orchestrator.onTrigger(BREAKOUT);
+
+    expect(h.sent).toHaveLength(0);
+    expect(h.consoleOnly).toHaveLength(1);
+    expect(h.consoleOnly[0]).toContain('WAIT');
+  });
+
+  it('мусор от модели -> WAIT только в консоль', async () => {
+    const h = make({ reply: 'не знаю' });
+    await h.orchestrator.onTrigger(BREAKOUT);
+
+    expect(h.sent).toHaveLength(0);
+    expect(h.consoleOnly[0]).toContain('WAIT');
+    expect(h.consoleOnly[0]).toContain('не разобран');
+  });
+});
+
+describe('пауза и режим', () => {
+  it('на паузе запросов к LLM нет', async () => {
+    const h = make();
+    h.orchestrator.pause();
+    await h.orchestrator.onTrigger(BREAKOUT);
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('после resume запросы идут снова', async () => {
+    const h = make();
+    h.orchestrator.pause();
+    h.orchestrator.resume();
+    await h.orchestrator.onTrigger(BREAKOUT);
+    expect(h.calls).toHaveLength(1);
+  });
+
+  it('смена режима влияет на подачу', async () => {
+    const h = make();
+    h.orchestrator.setMode('beginner');
+    await h.orchestrator.onTrigger(BREAKOUT);
+    expect(h.sent[0]).toContain('Что произошло');
+  });
+});
+
+describe('ошибки', () => {
+  it('падение LLM -> сообщение об ошибке, не тишина', async () => {
     const h = make({ error: true });
     await expect(h.orchestrator.onTrigger(BREAKOUT)).resolves.toBeUndefined();
-    expect(h.sent).toHaveLength(0);
+    expect(h.errors).toHaveLength(1);
+    expect(h.errors[0]).toContain('не удался');
   });
 
-  it('после ошибки следующий запрос снова проходит', async () => {
-    const h = make({ error: true });
+  it('исчерпание дневного лимита сообщает об этом', async () => {
+    const h = make({ config: config({ COOLDOWN_MS: '0', LLM_DAILY_LIMIT: '1' }) });
     await h.orchestrator.onTrigger(BREAKOUT);
-    const ok = make({});
-    expect(ok.calls).toHaveLength(0);
+    await h.orchestrator.onTrigger(BREAKOUT);
+    expect(h.errors).toHaveLength(1);
+    expect(h.errors[0]).toContain('лимит');
   });
 });

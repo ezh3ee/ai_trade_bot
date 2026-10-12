@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BybitWsClient } from '../../src/bybit/bybit-ws.ts';
 import type { WsHandle } from '../../src/bybit/bybit-ws.ts';
 import type { Trade } from '../../src/market/trade.ts';
@@ -66,6 +66,7 @@ interface Harness {
   readonly trades: Trade[];
   readonly resets: string[];
   readonly tickers: TickerData[];
+  readonly counters: { connected: number; disconnected: number };
   readonly client: BybitWsClient;
 }
 
@@ -76,6 +77,7 @@ function makeHarness(
   const trades: Trade[] = [];
   const resets: string[] = [];
   const tickers: TickerData[] = [];
+  const counters = { connected: 0, disconnected: 0 };
 
   const client = new BybitWsClient({
     url: 'wss://example/linear',
@@ -95,12 +97,18 @@ function makeHarness(
     onTicker: (update) => {
       tickers.push(update);
     },
+    onConnected: () => {
+      counters.connected += 1;
+    },
+    onDisconnected: () => {
+      counters.disconnected += 1;
+    },
     pingIntervalMs: overrides.pingIntervalMs ?? 1000,
     silenceTimeoutMs: overrides.silenceTimeoutMs ?? 30_000,
     maxGapMs: overrides.maxGapMs ?? 10_000,
   });
 
-  return { sockets, trades, resets, tickers, client };
+  return { sockets, trades, resets, tickers, counters, client };
 }
 
 describe('клиент Bybit', () => {
@@ -248,6 +256,78 @@ describe('клиент Bybit', () => {
     harness.sockets[0]?.fireMessage(tradeMessage('a', 1000));
 
     expect(harness.trades).toHaveLength(1);
+  });
+
+  it('сообщает о подключении и обрыве (§: /status должен знать)', () => {
+    const harness = makeHarness();
+    harness.client.start();
+    expect(harness.counters.connected).toBe(0);
+
+    harness.sockets[0]?.fireOpen();
+    expect(harness.counters.connected).toBe(1);
+    expect(harness.counters.disconnected).toBe(0);
+
+    harness.sockets[0]?.fireClose();
+    expect(harness.counters.disconnected).toBe(1);
+
+    vi.advanceTimersByTime(1_000);
+    harness.sockets[1]?.fireOpen();
+    expect(harness.counters.connected).toBe(2);
+  });
+
+  it('много одинакового мусора НЕ превращается в спам', () => {
+    const lines: string[] = [];
+    const noisy: Logger = {
+      debug: (m) => lines.push(m),
+      info: () => undefined,
+      warn: () => undefined,
+      error: () => undefined,
+    };
+
+    const harness = makeHarness();
+    const quiet = new BybitWsClient({
+      url: 'wss://example/linear',
+      symbol: 'BTCUSDT',
+      log: noisy,
+      connect: (url) => {
+        const socket = new FakeSocket(url);
+        harness.sockets.push(socket);
+        return socket;
+      },
+      onTrades: () => undefined,
+      onReset: () => undefined,
+      onTicker: () => undefined,
+      onConnected: () => undefined,
+      onDisconnected: () => undefined,
+    });
+    quiet.start();
+    const socket = harness.sockets.at(-1);
+    socket?.fireOpen();
+
+    // 500 одинаковых мусорных сообщений + 500 настоящих сделок
+    for (let i = 0; i < 500; i += 1) {
+      socket?.fireMessage('{{{ не json');
+      socket?.fireMessage(tradeMessage(`x${i}`, 1_700_000_000_000 + i));
+    }
+
+    expect(lines.length).toBeLessThanOrEqual(2);
+    expect(quiet.ignoredSummary()['не JSON']).toBe(500);
+  });
+
+  it('считает пропущенное по видам', () => {
+    const harness = makeHarness();
+    harness.client.start();
+    harness.sockets[0]?.fireOpen();
+
+    harness.sockets[0]?.fireMessage('{{{');
+    harness.sockets[0]?.fireMessage('{{{');
+    harness.sockets[0]?.fireMessage(
+      JSON.stringify({ topic: 'orderbook.50.BTCUSDT', data: [] }),
+    );
+
+    const summary = harness.client.ignoredSummary();
+    expect(summary['не JSON']).toBe(2);
+    expect(Object.keys(summary)).toHaveLength(2);
   });
 
   it('start() дважды не создаёт второе соединение', () => {

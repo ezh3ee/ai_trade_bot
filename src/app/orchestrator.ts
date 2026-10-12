@@ -1,4 +1,4 @@
-import type { AppConfig } from '../config/schema.ts';
+﻿import type { AppConfig } from '../config/schema.ts';
 import type { Logger } from '../config/load.ts';
 import type { LlmProvider } from '../ai/provider.ts';
 import type { Prompts, ResponseMode } from '../ai/prompts.ts';
@@ -9,18 +9,24 @@ import type { Signal } from '../ai/signal-schema.ts';
 import { parseSignal, WAIT_SIGNAL } from '../ai/signal-schema.ts';
 import type { TickerSnapshot } from '../bybit/ticker.ts';
 import type { TriggerEvent } from '../market/trade.ts';
-import type { MessageSender } from '../telegram/bot.ts';
+import type { Notifier } from '../telegram/telegram-bot.ts';
 import { formatSignal } from '../telegram/format.ts';
+import type { RuntimeState } from './runtime-state.ts';
 
 /**
- * Связка цепочки: триггер -> снимок -> промпт -> LLM -> проверка -> Telegram.
+ * Связка цепочки: триггер -> снимок -> промпт -> LLM -> проверка -> вывод.
  *
- * Чистая логика, без Nest (§7 разделение ответственности).
+ * Чистая логика, без Nest.
  *
- * Три ограничения, и все три важны:
- *  - не запускать новый анализ, пока предыдущий идёт (§9 «общая защита»);
- *  - не чаще раза в cooldownMs;
- *  - не больше лимита в сутки, чтобы баг не слил баланс.
+ * Куда уходит результат:
+ *   LONG / SHORT -> Telegram (и в консоль)
+ *   WAIT         -> только консоль, иначе телефон заспамится
+ *   ошибки       -> Telegram с ограничителем, иначе молча сломаемся
+ *
+ * Ограничения, все три важны:
+ *   - не запускать новый анализ, пока предыдущий идёт (§9);
+ *   - не чаще раза в cooldownMs;
+ *   - не больше лимита в сутки.
  */
 
 export interface OrchestratorDeps {
@@ -28,7 +34,8 @@ export interface OrchestratorDeps {
   readonly log: Logger;
   readonly llm: LlmProvider;
   readonly prompts: Prompts;
-  readonly sender: MessageSender;
+  readonly notifier: Notifier;
+  readonly state: RuntimeState;
   readonly ticker: () => TickerSnapshot;
   readonly priceNow: () => number | undefined;
   readonly now: () => number;
@@ -41,10 +48,37 @@ const STALE_AFTER_MS = 90_000;
 export class AnalysisOrchestrator {
   private inFlight = false;
   private lastRunAtMs: number | undefined;
-  private todayCount = 0;
-  private todayKey = '';
 
   constructor(private readonly deps: OrchestratorDeps) {}
+
+  get isPaused(): boolean {
+    return this.deps.state.isPaused;
+  }
+
+  get currentMode(): ResponseMode {
+    return this.deps.state.currentMode;
+  }
+
+  get analysesToday(): number {
+    return this.deps.state.analyses;
+  }
+
+  get lastSignalInfo(): { readonly direction: string; readonly atMs: number } | undefined {
+    return this.deps.state.signal;
+  }
+
+  pause(): void {
+    this.deps.state.setPaused(true);
+  }
+
+  resume(): void {
+    this.deps.state.setPaused(false);
+    this.lastRunAtMs = undefined;
+  }
+
+  setMode(mode: ResponseMode): void {
+    this.deps.state.setMode(mode);
+  }
 
   /** Плановый запуск раз в минуту (§9D). */
   startPlanned(): () => void {
@@ -75,6 +109,10 @@ export class AnalysisOrchestrator {
   private async analyse(event: TriggerEvent, reason: string): Promise<void> {
     const nowMs = this.deps.now();
 
+if (this.deps.state.isPaused) {
+      this.deps.log.debug('на паузе, пропускаю');
+      return;
+    }
     if (this.inFlight) {
       this.deps.log.debug('анализ уже идёт, пропускаю', { причина: reason });
       return;
@@ -82,12 +120,16 @@ export class AnalysisOrchestrator {
 
     const last = this.lastRunAtMs;
     if (last !== undefined && nowMs - last < this.deps.config.schedule.cooldownMs) {
-      this.deps.log.debug('кулдаун', { осталось_мс: this.deps.config.schedule.cooldownMs - (nowMs - last) });
+      this.deps.log.debug('кулдаун', {
+        осталось_мс: this.deps.config.schedule.cooldownMs - (nowMs - last),
+      });
       return;
     }
 
-    if (!this.takeDailySlot(nowMs)) {
-      this.deps.log.warn('дневной лимит исчерпан', { лимит: this.deps.config.llm.dailyLimit });
+if (!this.deps.state.takeDailySlot(nowMs, this.deps.config.llm.dailyLimit)) {
+      await this.deps.notifier.reportError(
+        `Дневной лимит анализов исчерпан (${this.deps.config.llm.dailyLimit}). Продолжаю наблюдение.`,
+      );
       return;
     }
 
@@ -96,30 +138,23 @@ export class AnalysisOrchestrator {
     try {
       await this.run(event, reason, nowMs);
     } catch (error: unknown) {
-      this.deps.log.error('анализ провалился', { ошибка: error instanceof Error ? error.message : String(error) });
+      const message = error instanceof Error ? error.message : String(error);
+      await this.deps.notifier.reportError(`Анализ не удался: ${message}`);
     } finally {
       this.inFlight = false;
     }
   }
 
-  private takeDailySlot(nowMs: number): boolean {
-    const key = new Date(nowMs).toISOString().slice(0, 10);
-    if (key !== this.todayKey) {
-      this.todayKey = key;
-      this.todayCount = 0;
-    }
-    if (this.todayCount >= this.deps.config.llm.dailyLimit) return false;
-    this.todayCount += 1;
-    return true;
-  }
-
-  private async run(event: TriggerEvent, reason: string, nowMs: number): Promise<void> {
-    const mode = this.deps.config.responseMode;
-    const view = this.buildContext(event, nowMs);
+private async run(event: TriggerEvent, reason: string, nowMs: number): Promise<void> {
+    const mode = this.currentMode;
+    const context = this.buildContext(event, nowMs);
 
     this.deps.log.debug('собираю промпт', { режим: mode, причина: reason });
-    const prompt = renderPrompt(this.deps.prompts, mode, this.scopeOf(view));
-    this.deps.log.debug('промпт готовый', { системный_символов: prompt.system.length, пользовательский_символов: prompt.user.length });
+    const prompt = renderPrompt(this.deps.prompts, mode, this.scopeOf(context));
+    this.deps.log.debug('промпт', {
+      системный_символов: prompt.system.length,
+      пользовательский_символов: prompt.user.length,
+    });
     this.deps.log.debug('промпт.system', { текст: prompt.system });
     this.deps.log.debug('промпт.user', { текст: prompt.user });
 
@@ -141,15 +176,36 @@ export class AnalysisOrchestrator {
       signal = { ...WAIT_SIGNAL, summary: `Ответ модели не разобран: ${parsed.reason}` };
     }
 
-    const stale = this.isStale(view, nowMs);
-    if (stale) this.deps.log.warn('ответ устарел', { снимок_в_мс: nowMs });
+    const stale = this.isStale(context, nowMs);
+    if (stale) this.deps.log.warn('ответ устарел');
 
-    const text = formatSignal(mode, view, signal, stale);
-    await this.deps.sender.send(this.deps.config.telegram.adminChatId, text);
-    this.deps.log.info('отправлено в Telegram', {
-      направление: signal.direction,
-      уверенность: signal.confidence,
-      устарело: stale,
+    this.deliver(mode, context, signal, stale);
+  }
+
+  /**
+   * Разделение каналов. WAIT в Telegram не уходит — иначе бот
+   * превратится в спам, который ещё и без звука.
+   */
+  private deliver(
+    mode: ResponseMode,
+    context: MarketContext,
+    signal: Signal,
+    stale: boolean,
+  ): void {
+    const text = formatSignal(mode, context, signal, stale);
+
+if (signal.direction === 'WAIT') {
+      this.deps.state.setSignal('WAIT', this.deps.now());
+      this.deps.notifier.logOnly(
+        `LLM: WAIT | уверенность ${signal.confidence} | ${signal.summary}`,
+      );
+      this.deps.log.debug('полный разбор WAIT', { текст: text });
+      return;
+    }
+
+    this.deps.state.setSignal(signal.direction, this.deps.now());
+    void this.deps.notifier.notify(text).catch((error: unknown) => {
+      this.deps.log.error('не смог отправить сигнал', { ошибка: String(error) });
     });
   }
 
@@ -176,10 +232,9 @@ export class AnalysisOrchestrator {
     });
   }
 
-private scopeOf(context: MarketContext): Readonly<Record<string, unknown>> {
-    // Рыночные поля могут отсутствовать (Bybit их иногда не шлёт).
-    // Для шаблона это НЕ ошибка: подставляем null -> печатается «—».
-    // Ошибкой считается только опечатка в имени переменной.
+  private scopeOf(context: MarketContext): Readonly<Record<string, unknown>> {
+    // Отсутствие рыночных данных (Bybit их иногда не шлёт) — это НЕ ошибка:
+    // подставляем null -> печатается «—». Ошибка — только опечатка в имени.
     const orNull = (value: number | string | undefined): number | string | null =>
       value === undefined ? null : value;
 
@@ -222,5 +277,3 @@ private scopeOf(context: MarketContext): Readonly<Record<string, unknown>> {
     };
   }
 }
-
-export type { ResponseMode };

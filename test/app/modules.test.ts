@@ -1,17 +1,20 @@
-import { describe, expect, it } from 'vitest';
+﻿import { describe, expect, it } from 'vitest';
 import { Test } from '@nestjs/testing';
 import { AppConfigModule } from '../../src/config/config.module.ts';
 import { MarketModule, toTriggerEngineConfig } from '../../src/market/market.module.ts';
-import { BybitModule } from '../../src/bybit/bybit.module.ts';
-import { MarketStreamService } from '../../src/bybit/market-stream.service.ts';
+import { MarketStreamService, BybitModule } from '../../src/bybit/market-stream.service.ts';
+import { TelegramModule } from '../../src/telegram/telegram.module.ts';
+import { TelegramFeedService } from '../../src/telegram/status-feed.ts';
 import { AnalysisOrchestrator } from '../../src/app/orchestrator.ts';
 import { loadPrompts } from '../../src/ai/prompts.ts';
+import { AiModule } from '../../src/ai/ai.module.ts';
 import {
   APP_CONFIG,
   APP_LOGGER,
   ORCHESTRATOR,
-  PROMPTS,
-  TELEGRAM_SENDER,
+PROMPTS,
+  TELEGRAM_BOT,
+  TELEGRAM_FEED,
   TRIGGER_ENGINE,
 } from '../../src/tokens.ts';
 import { TriggerEngine } from '../../src/market/trigger-engine.ts';
@@ -52,7 +55,7 @@ describe('сборка Nest', () => {
 
   it('поднимает полный набор модулей и связывает зависимости', async () => {
     const moduleRef = await Test.createTestingModule({
-      imports: [AppConfigModule, MarketModule, BybitModule],
+      imports: [AppConfigModule, MarketModule, TelegramModule, AiModule, BybitModule],
     })
       .overrideProvider(APP_CONFIG)
       .useValue(configOf())
@@ -64,7 +67,8 @@ describe('сборка Nest', () => {
     expect(engine).toBeInstanceOf(TriggerEngine);
     expect(moduleRef.get(MarketStreamService)).toBeInstanceOf(MarketStreamService);
     expect(moduleRef.get(ORCHESTRATOR)).toBeInstanceOf(AnalysisOrchestrator);
-    expect(moduleRef.get(TELEGRAM_SENDER)).toBeDefined();
+expect(moduleRef.get(TELEGRAM_BOT)).toBeDefined();
+    expect(moduleRef.get(TELEGRAM_FEED)).toBeInstanceOf(TelegramFeedService);
   });
 
   it('при плохом .env приложение не поднимается с понятной ошибкой', async () => {

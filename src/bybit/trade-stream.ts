@@ -3,16 +3,20 @@ import type { TriggerEngine } from '../market/trigger-engine.ts';
 import type { Trade, TriggerEvent } from '../market/trade.ts';
 import type { MarketFeed } from '../market/market-feed.ts';
 import type { TickerData } from './ticker.ts';
+import { formatHeartbeat } from '../telegram/status.ts';
+
+/** Как часто печатать пульс. Одна строка в минуту вместо 60 в секунду. */
+const HEARTBEAT_MS = 60_000;
 
 /**
  * Прогоняет сделки через триггеры и печатает происходящее (§14).
  *
- * Чистая логика: ни одного декоратора, ни одного импорта Nest. Проверяется
- * обычными тестами без поднятия приложения.
+ * Чистая логика: ни одного декоратора, ни одного импорта Nest.
  */
 export class TradeStreamProcessor {
   private tradeCount = 0;
-  private lastLoggedSecond = 0;
+  private windowCount = 0;
+  private lastHeartbeatMs: number;
 
   constructor(
     private readonly engine: TriggerEngine,
@@ -20,22 +24,25 @@ export class TradeStreamProcessor {
     private readonly log: Logger,
     private readonly now: () => number = Date.now,
     private readonly onTrigger: (event: TriggerEvent) => void = () => {},
-  ) {}
+    private readonly ignoredCount: () => number = () => 0,
+  ) {
+    this.lastHeartbeatMs = now();
+  }
 
   get totalTrades(): number {
     return this.tradeCount;
   }
 
-  /** Применяет дельту тикера: пришедшие поля обновляются, остальные живут. */
   applyTicker(update: TickerData): void {
     this.feed.applyTicker(update, this.now());
   }
 
-  /** Счётчик и окно после разрыва в данных (§8: не считать по дырявым данным). */
+  /** Счётчик и окно после разрыва в данных (§8). */
   reset(reason: string): void {
     this.engine.reset();
     this.tradeCount = 0;
-    this.lastLoggedSecond = 0;
+    this.windowCount = 0;
+    this.lastHeartbeatMs = this.now();
     this.log.warn('окно триггеров сброшено, прогрев заново', { причина: reason });
   }
 
@@ -49,7 +56,8 @@ export class TradeStreamProcessor {
     }
 
     this.tradeCount += trades.length;
-    this.logRate(trades);
+    this.windowCount += trades.length;
+    this.heartbeat(nowMs);
   }
 
   private ingestOne(trade: Trade, nowMs: number): TriggerEvent[] {
@@ -70,18 +78,31 @@ export class TradeStreamProcessor {
     }
   }
 
-  /** Не засоряем лог каждой сделкой — раз в секунду одна строка. */
-  private logRate(trades: readonly Trade[]): void {
-    const second = Math.floor(this.now() / 1000);
-    if (second === this.lastLoggedSecond) return;
-    this.lastLoggedSecond = second;
+  /**
+   * Одна строка в минуту. Раньше было три строки в секунду — это мусор,
+   * в котором не видно ничего полезного (§14 логирование должно быть читаемым).
+   */
+  private heartbeat(nowMs: number): void {
+    const elapsed = nowMs - this.lastHeartbeatMs;
+    if (elapsed < HEARTBEAT_MS) return;
 
-    const newest = trades[trades.length - 1];
-    this.log.debug('сделки', {
-      всего: this.tradeCount,
-      в_пакете: trades.length,
-      цена: newest?.price ?? '—',
-    });
+    const ticker = this.feed.ticker();
+    this.log.info(
+      formatHeartbeat({
+        symbol: ticker.symbol,
+        tradesTotal: this.tradeCount,
+        tradesInWindow: this.windowCount,
+        windowMs: elapsed,
+        price: this.feed.priceNow(),
+        markPrice: ticker.markPrice,
+        fundingRate: ticker.fundingRate,
+        connected: true,
+        ignored: this.ignoredCount(),
+      }),
+    );
+
+    this.windowCount = 0;
+    this.lastHeartbeatMs = nowMs;
   }
 
   private logTrigger(event: TriggerEvent): void {

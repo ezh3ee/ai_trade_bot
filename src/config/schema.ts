@@ -37,6 +37,10 @@ const nonNegativeInt = (label: string) =>
       .min(0, `${label} не может быть отрицательным`),
   );
 
+/** true/false/1/0/да/нет — всё, что люди реально пишут в .env. */
+const boolFromEnv = (label: string) =>
+  z.preprocess(blankToUndefined, z.enum(['true', 'false', '1', '0', 'yes', 'no', 'да', 'нет']).transform((value) => value === 'true' || value === '1' || value === 'yes' || value === 'да'));
+
 /** BTCUSDT, ETHUSDT, BTCUSDT_25MAR25 и т.п. Только буквы, цифры, дефис, подчёркивание. */
 const symbolSchema = z
   .string()
@@ -60,6 +64,7 @@ export const rawEnvSchema = z.object({
 
   TELEGRAM_BOT_TOKEN: requiredText,
   TELEGRAM_ADMIN_CHAT_ID: z.preprocess(blankToUndefined, chatIdSchema),
+  TELEGRAM_DRY_RUN: boolFromEnv('TELEGRAM_DRY_RUN').default(false),
 
   LLM_BASE_URL: urlSchema,
   LLM_API_KEY: requiredText,
@@ -99,6 +104,8 @@ export interface AppConfig {
   readonly telegram: {
     readonly botToken: string;
     readonly adminChatId: string;
+    /** Печатать сообщения в консоль вместо Telegram. Для проверки без VPN. */
+    readonly dryRun: boolean;
   };
   readonly llm: {
     readonly baseUrl: string;
@@ -140,6 +147,7 @@ export function toAppConfig(raw: RawEnv): AppConfig {
     telegram: {
       botToken: raw.TELEGRAM_BOT_TOKEN,
       adminChatId: raw.TELEGRAM_ADMIN_CHAT_ID,
+      dryRun: raw.TELEGRAM_DRY_RUN,
     },
     llm: {
       baseUrl: raw.LLM_BASE_URL,
