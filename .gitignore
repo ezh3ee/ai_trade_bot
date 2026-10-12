@@ -1,0 +1,18 @@
+node_modules/
+dist/
+
+# секреты
+.env
+.env.*
+!.env.example
+
+# sqlite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# промпты пользователя (в репозитории лежит prompts.example.yml)
+prompts.yml
+
+.DS_Store
